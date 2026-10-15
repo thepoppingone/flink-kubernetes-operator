@@ -81,6 +81,7 @@ import org.apache.flink.runtime.jobgraph.JobVertexID;
 import org.apache.flink.runtime.jobgraph.JobVertexResourceRequirements;
 import org.apache.flink.util.concurrent.Executors;
 
+import io.fabric8.kubernetes.api.model.DeletionPropagation;
 import io.fabric8.kubernetes.api.model.ObjectMeta;
 import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.server.mock.EnableKubernetesMockClient;
@@ -1362,6 +1363,54 @@ public class ApplicationReconcilerTest extends OperatorTestBase {
                         requireMetadata);
         assertEquals(deleted.get(), !requireMetadata);
         assertEquals(JobManagerDeploymentStatus.DEPLOYING, status.getJobManagerDeploymentStatus());
+    }
+
+    @Test
+    public void testCleanupFallsBackToStatelessWhenSavepointOnDeletionIsNotPossible()
+            throws Exception {
+        var conf = configManager.getDefaultConfig();
+        conf.set(KubernetesOperatorConfigOptions.SAVEPOINT_ON_DELETION, true);
+        configManager.updateDefaultConfig(conf);
+
+        var clusterDeleted = new AtomicBoolean(false);
+        flinkService =
+                new TestingFlinkService(kubernetesClient) {
+                    @Override
+                    protected void deleteClusterInternal(
+                            String namespace,
+                            String clusterId,
+                            Configuration conf,
+                            DeletionPropagation deletionPropagation) {
+                        clusterDeleted.set(true);
+                        super.deleteClusterInternal(
+                                namespace, clusterId, conf, deletionPropagation);
+                    }
+                };
+
+        FlinkDeployment deployment = TestUtils.buildApplicationCluster();
+        reconciler.reconcile(
+                deployment, TestUtils.createContextWithReadyFlinkDeployment(kubernetesClient));
+        verifyAndSetRunningJobsToStatus(deployment, flinkService.listJobs());
+
+        // The job lost its JobManager and is stuck RECONCILING: a savepoint is impossible, and
+        // the deletion must still complete instead of failing on every retry and holding the
+        // finalizer forever.
+        deployment.getStatus().getJobStatus().setState(RECONCILING);
+        flinkResourceEventCollector.events.clear();
+
+        reconciler.cleanup(
+                deployment, TestUtils.createContextWithReadyFlinkDeployment(kubernetesClient));
+
+        assertTrue(clusterDeleted.get());
+        assertEquals(
+                JobManagerDeploymentStatus.MISSING,
+                deployment.getStatus().getJobManagerDeploymentStatus());
+        assertThat(TestUtils.getFlinkStateSnapshotsForResource(kubernetesClient, deployment))
+                .isEmpty();
+        var event = flinkResourceEventCollector.events.getLast();
+        assertEquals(EventRecorder.Type.Warning.name(), event.getType());
+        assertEquals(EventRecorder.Reason.SavepointError.name(), event.getReason());
+        assertTrue(event.getMessage().contains("RECONCILING"), event.getMessage());
     }
 
     @Test

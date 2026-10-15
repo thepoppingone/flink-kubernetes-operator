@@ -73,6 +73,9 @@ public class ApplicationReconciler
     private static final Logger LOG = LoggerFactory.getLogger(ApplicationReconciler.class);
     static final String MSG_RECOVERY = "Recovering lost deployment";
     static final String MSG_RESTART_UNHEALTHY = "Restarting unhealthy job";
+    static final String MSG_SAVEPOINT_ON_DELETION_SKIPPED =
+            "Job is %s, not RUNNING, so no savepoint can be taken on deletion. Deleting the"
+                    + " cluster without a savepoint.";
 
     /**
      * Mirrors {@code ApplicationResultStoreOptions#STORAGE_PATH}, introduced in Flink 2.3. The
@@ -447,6 +450,27 @@ public class ApplicationReconciler
                     observeConfig.getBoolean(KubernetesOperatorConfigOptions.SAVEPOINT_ON_DELETION)
                             ? SuspendMode.SAVEPOINT
                             : SuspendMode.STATELESS;
+            if (suspendMode == SuspendMode.SAVEPOINT && !ReconciliationUtils.isJobRunning(status)) {
+                // A savepoint can only be taken from a RUNNING job. For any other non-terminal
+                // state (RECONCILING, RESTARTING, CANCELLING, ...) the stop-with-savepoint
+                // would throw on every cleanup attempt and the finalizer would never be
+                // released. Fall back to the same teardown a deletion without
+                // savepoint-on-deletion gets. Retained checkpoints in the checkpoint directory
+                // are not touched by this.
+                var msg =
+                        String.format(
+                                MSG_SAVEPOINT_ON_DELETION_SKIPPED,
+                                status.getJobStatus().getState());
+                LOG.warn(msg);
+                eventRecorder.triggerEvent(
+                        deployment,
+                        EventRecorder.Type.Warning,
+                        EventRecorder.Reason.SavepointError,
+                        EventRecorder.Component.Job,
+                        msg,
+                        ctx.getKubernetesClient());
+                suspendMode = SuspendMode.STATELESS;
+            }
             cancelJob(ctx, suspendMode);
         }
         return DeleteControl.defaultDelete();
